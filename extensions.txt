@@ -500,7 +500,6 @@
 .cer
 .common.php
 .de.html
-.html‎
 .jbf
 .lbi
 .lib.php
