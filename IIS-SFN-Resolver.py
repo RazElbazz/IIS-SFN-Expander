@@ -122,7 +122,7 @@ class Scanner(object):
             with open('extensions.txt', 'r') as f:
                 ext_list = [l.strip() if l.startswith('.') else '.' + l.strip() for l in f]
         except: pass
-        
+
         count = 0
         results = set()
         targets = [('DIR', d) for d in self.dirs] + [('FILE', f) for f in self.files]
@@ -132,10 +132,11 @@ class Scanner(object):
         print(f"\n[+] Phase 2: Short File Name Scanner")
 
         for i, (stype, surl) in enumerate(targets, 1):
-            sfn = surl[1:]
+            sfn = surl.split('/')[-1]
             base = sfn.split('~')[0].upper()
             sext = sfn.split('.')[-1].replace('*', '').upper() if '.' in sfn else ""
             
+            print(f"Searching for {base = }")
             matches, stop = self.github.search_full_names(base, sext if stype == 'FILE' else None)
             if stop: break
             
