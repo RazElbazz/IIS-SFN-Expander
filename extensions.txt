@@ -558,7 +558,6 @@
 .out
 .pgt
 .php,
-.php‎
 .po
 .prt
 .query
