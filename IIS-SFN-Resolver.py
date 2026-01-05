@@ -122,13 +122,14 @@ class Scanner(object):
             with open('extensions.txt', 'r') as f:
                 ext_list = [l.strip() if l.startswith('.') else '.' + l.strip() for l in f]
         except: pass
-
+        
+        count = 0
         results = set()
         targets = [('DIR', d) for d in self.dirs] + [('FILE', f) for f in self.files]
         total = len(targets)
         
         f_handle = open(output_file, 'a') if output_file else None
-        print(f"\nPhase 2: GitHub Resolution Progress...")
+        print(f"\n[+] Phase 2: Short File Name Scanner")
 
         for i, (stype, surl) in enumerate(targets, 1):
             sfn = surl[1:]
@@ -151,7 +152,8 @@ class Scanner(object):
 
                 for word in to_add:
                     if word not in results:
-                        print(f"{stype} | {sfn} | {i}/{total} | {word}")
+                        count += 1
+                        print(f"{stype} | {sfn} | {i}/{total} ({count}) | {word}")
                         results.add(word)
                         if f_handle: f_handle.write(word + '\n'); f_handle.flush()
             time.sleep(2) 
@@ -181,6 +183,6 @@ if __name__ == '__main__':
 
     s = Scanner(args.u, args.token)
     if args.force or s.is_vulnerable():
-        print("[+] Starting Scan...")
+        print("[+] Phase 1: Short File Name Scanner")
         s.run()
         s.resolve_all(args.output)
